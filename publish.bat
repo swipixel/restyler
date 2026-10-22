@@ -16,7 +16,7 @@ hf auth whoami || (
     goto :fail
 )
 rem creates the repo (public) if it doesn't exist yet
-hf upload %REPO% hf . --commit-message "Restyler v3 ep60 + styles.json" || goto :fail
+hf upload %REPO% hf . --commit-message "Restyler V3: ep60 + partial model + styles.json" || goto :fail
 echo Uploaded. Check: https://huggingface.co/%REPO%/tree/main
 
 echo.
@@ -24,7 +24,7 @@ echo === git ===
 where git >nul 2>nul || (echo git not found - skipped. & goto :done)
 if not exist .git git init -b main
 git add -A
-git commit -m "Restyler 0.3.0 - self-installing release" || echo (nothing new to commit, or set: git config --global user.name / user.email)
+git commit -m "Restyler V3 (3.0.0)" || echo (nothing new to commit, or set: git config --global user.name / user.email)
 echo.
 echo To put it on GitHub:   gh repo create SwiPixel/restyler --public --source . --push
 echo   (or create an empty repo on github.com, then: git remote add origin URL ^& git push -u origin main)

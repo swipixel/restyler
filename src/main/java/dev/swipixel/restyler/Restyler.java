@@ -106,14 +106,14 @@ public final class Restyler {
     private float wetSeconds = 5f;       // AUTO: time to get fully wet once rain is at full strength
     private float drySeconds = 20f;      // AUTO: time to dry from fully wet after the rain stopped
     private boolean profile = false;
-    private boolean async = false;       // PERFORMANCE MODE: network on its own thread + re-projection (lower quality)
+    private boolean async = true;        // PERFORMANCE MODE: network on its own thread + re-projection (lower quality)
     private boolean stabilizer = true;   // re-project + blend with history (false = newest result, no correction)
-    private float stabNew = 0.5f;        // weight of a new network result in the history (1 = no smoothing)
+    private final float stabNew = 1f;    // newest network result only (mixing with older ones only blurred motion)
     private boolean devignette = true;   // divide out the model's screen-fixed vignette (vignette.json)
     private boolean lightLock = true;    // large-scale brightness stays within [lockMin, lockMax] x the game's
-    private boolean texelSnap = true;    // look read once per block texel (paint locked to the block grid)
-    private float detail = 1.0f;         // full-res game texture detail on top of the look (0 = off, 1 = full)
+    private float detail = 0f;           // full-res game texture detail on top of the look (0 = off, 1 = full)
     private float lockMin = 0.7f, lockMax = 1.25f;
+    private boolean partialUpdate = true; // Performance mode: repaint only the part of the screen that changed
     private volatile float[] vigNormal, vigWet;   // log2 correction per cell, VIG_GX x VIG_GY
     private static final int VIG_GX = 32, VIG_GY = 18;
 
@@ -183,6 +183,67 @@ public final class Restyler {
     private final ByteBuffer wRgba = ByteBuffer.allocateDirect(PLANE * 4).order(ByteOrder.nativeOrder());
     private FloatBuffer wStyle;
 
+    // ---- partial update: repaint only what changed (needs <model>_partial.onnx, made by make_partial.py) ----
+    private static final int TILE = 32, TILES_X = W / TILE, TILES_Y = H / TILE;   // 16 x 9 tiles of 32 px
+    private static final int MARGIN = 48;              // context the network gets around the repainted part (px)
+    private static final float DIRTY_FRAC = 0.06f;     // a tile is repainted if > 6 % of its pixels changed
+    private static final float DIRTY_THRESH = 0.12f;   // vanilla colour change that counts as "changed"
+    private static final float FULL_AREA = 0.55f;      // larger than this -> just repaint everything
+    private static final long FULL_EVERY_NS = 2_000_000_000L;   // full repaint at least every 2 s ...
+    private static final int FULL_EVERY_JOBS = 10;               // ... and after 10 partial ones (re-projection blurs)
+    private volatile boolean partialModel = false;     // the loaded model takes norm_stats / use_stats
+    private int statsRows = 0;                         // 2 x number of GroupNorms
+    private volatile boolean forceFull = true;         // next job repaints everything (history reset, model change)
+    private volatile float[] jobRegion;                // last job: null = whole frame, else x0,y0,x1,y1 (0..1, GL)
+    private float[] wStats;                            // worker: GroupNorm statistics of the last full repaint
+    private long wLastFullNs = 0;
+    private int wSinceFull = 0;
+    private float[] wLastStyle;
+    private FloatBuffer wCrop;
+    private FloatBuffer wStatsBuf;
+    private volatile double areaEma = 1.0, skipEma = 0.0;   // share of the frame repainted per run / runs skipped
+    private boolean syncPartialFailed = false;
+
+    // ---- sharpen while still: when nothing changes, repaint the screen at DOUBLE resolution, tile by tile ----
+    private boolean sharpen = true;
+    private static final int RT_W = 128, RT_H = 96, RT_X = W / RT_W, RT_Y = H / RT_H;   // 4 x 3 tiles (1x px)
+    private static final int REF_W = 1280, REF_H = 720; // the screen at 2.5x the network's normal resolution
+    private static final int RC_W = 488, RC_H = 408;   // 2.5x network input per tile: tile + fade border + context
+    private static final long FADE_NS = 200_000_000L;  // a sharpened tile fades in over 0.2 s
+    private int refFbo = -1, refTex = -1;              // the 1280x720 capture (only while sharpening)
+    private final float[] fadeP = new float[12];       // render thread: fade progress per tile (-1 = none)
+    private final long[] fadeStart = new long[12];
+    private final int[] fadeW2 = new int[12], fadeH2 = new int[12];
+    private final float[][] fadeRect = new float[12][], fadeInner = new float[12][];
+    private static final int R_FEATHER = 8;            // 1x px around a tile where it fades in
+    private static final float SHARPEN_MAX_CHANGE = 0.25f;  // sharpen between repaints while < 25 % changes
+    private boolean capHaveRef = false;                // the capture in flight brought its 1280x720 version
+    private final byte[] refBytes = new byte[REF_W * REF_H * 4];
+    private final ByteBuffer refReadBuf = ByteBuffer.allocateDirect(REF_W * REF_H * 4).order(ByteOrder.nativeOrder());
+    private int pbo2 = -1;
+    private volatile boolean jobKeepSharp = false;     // last job (1x): keep the sharp pixels that didn't change
+    private boolean wLastWasPartial = false;           // worker: alternate 1x repaint / sharpening while moving
+    private volatile double sharpFrac = 0;             // share of the screen that is sharp (from the last capture)
+    private volatile int jobRefTile = -1;              // last job: >= 0 = it was a 2x tile
+    private volatile int jobCandidates = 0;            // last job: tiles that still wanted sharpening (incl. its own)
+    // FOCUS PULL: sharpened tiles are staged (shown out of focus = the 1x look) until the whole screen is done, then
+    // the screen focuses at once, like an eye - no tile-by-tile "tetris"
+    private static final long REVEAL_NS = 1_000_000_000L;      // the focus pull takes 1 s (slow = unnoticed)
+    private static final long REVEAL_WAIT_NS = 1_000_000_000L; // moving: focus what is staged at least every 1 s
+    private long stagedSinceNs = -1;                   // render thread: first staged tile not yet in focus
+    private long revealStartNs = -1;                   // focus pull running since (-1 = none)
+    private boolean debugView = false;                 // colour what is cached (not saved)
+    private volatile int jobRefW2, jobRefH2;
+    private volatile int[] jobRefRect;                 // its pixels: 1x px, top-down {x0, y0, x1, y1}
+    private FloatBuffer wRefIn;
+    private final ByteBuffer wRefRgba = ByteBuffer.allocateDirect(Stabilizer.REF_MAX_W * Stabilizer.REF_MAX_H * 4)
+            .order(ByteOrder.nativeOrder());
+
+    {
+        java.util.Arrays.fill(fadeP, -1f);
+    }
+
+
     private Restyler() {
     }
 
@@ -217,11 +278,11 @@ public final class Restyler {
                 profile = bool(p, "profile", profile);
                 async = bool(p, "async", async);
                 stabilizer = bool(p, "stabilizer", stabilizer);
-                stabNew = Math.max(0.05f, Math.min(1f, num(p, "stabilizer_new", stabNew)));
                 devignette = bool(p, "devignette", devignette);
                 lightLock = bool(p, "light_lock", lightLock);
                 detail = Math.max(0f, Math.min(1.5f, num(p, "detail", detail)));
-                texelSnap = bool(p, "texel_snap", texelSnap);
+                partialUpdate = bool(p, "partial_update", partialUpdate);
+                sharpen = bool(p, "sharpen_when_still", sharpen);
                 lockMin = Math.max(0.05f, Math.min(1f, num(p, "light_lock_min", lockMin)));
                 lockMax = Math.max(1f, Math.min(4f, num(p, "light_lock_max", lockMax)));
             }
@@ -252,11 +313,11 @@ public final class Restyler {
             p.setProperty("profile", Boolean.toString(profile));
             p.setProperty("async", Boolean.toString(async));
             p.setProperty("stabilizer", Boolean.toString(stabilizer));
-            p.setProperty("stabilizer_new", fmt(stabNew));
             p.setProperty("devignette", Boolean.toString(devignette));
             p.setProperty("light_lock", Boolean.toString(lightLock));
             p.setProperty("detail", fmt(detail));
-            p.setProperty("texel_snap", Boolean.toString(texelSnap));
+            p.setProperty("partial_update", Boolean.toString(partialUpdate));
+            p.setProperty("sharpen_when_still", Boolean.toString(sharpen));
             p.setProperty("light_lock_min", fmt(lockMin));
             p.setProperty("light_lock_max", fmt(lockMax));
             try (Writer w = Files.newBufferedWriter(configFile)) {
@@ -265,8 +326,8 @@ public final class Restyler {
                         + "AUTO: wet follows rain in rainy biomes; wet_seconds/dry_seconds = how fast it gets wet/dries; "
                         + "auto_max_wet = wetness at full rain. normal_style/wet_style = labels in styles.json. "
                         + "async = Performance mode: network on its own thread, full FPS but lower quality (false = full quality, "
-                        + "uses run_every_n_frames). stabilizer: re-project the look with the depth buffer; "
-                        + "stabilizer_new = weight of each new network result (lower = calmer, slower to react).");
+                        + "uses run_every_n_frames). stabilizer: re-project the look with the depth buffer. "
+                        + "partial_update: repaint only what changed. sharpen_when_still: 2.5x tiles while nothing changes.");
             }
         } catch (Exception e) {
             LOG.warn("Restyler: could not save {}", configFile, e);
@@ -318,16 +379,42 @@ public final class Restyler {
         if (on) {
             loadFailed = false;   // allow another load attempt, e.g. after copying the model
             stab.reset();         // the old history is from another place / time
+            forceFull = true;
         }
         save();
     }
 
-    public boolean isTexelSnap() {
-        return texelSnap;
+    public boolean isPartialUpdate() {
+        return partialUpdate;
     }
 
-    public void setTexelSnap(boolean on) {
-        texelSnap = on;
+    public boolean isSharpen() {
+        return sharpen;
+    }
+
+    public void setSharpen(boolean on) {
+        sharpen = on;
+        forceFull = true;     // back to the normal resolution everywhere
+        save();
+    }
+
+    public boolean isDebugView() {
+        return debugView;
+    }
+
+    public void setDebugView(boolean on) {
+        debugView = on;
+    }
+
+    public boolean hasPartialModel() {
+        return partialModel;
+    }
+
+    public void setPartialUpdate(boolean on) {
+        partialUpdate = on;
+        syncPartialFailed = false;
+        stab.reset();         // the history may be old (it isn't kept up to date in the normal quality mode)
+        forceFull = true;
         save();
     }
 
@@ -377,6 +464,7 @@ public final class Restyler {
         async = on;
         stabilizer = true;
         stab.reset();
+        forceFull = true;
         haveOutput = false;
         save();
     }
@@ -472,7 +560,8 @@ public final class Restyler {
 
     public List<String> modelFiles() {
         try (Stream<Path> files = Files.list(dir)) {
-            return files.map(f -> f.getFileName().toString()).filter(f -> f.endsWith(".onnx")).sorted().toList();
+            return files.map(f -> f.getFileName().toString())
+                    .filter(f -> f.endsWith(".onnx") && !f.endsWith("_partial.onnx")).sorted().toList();
         } catch (Exception e) {
             return List.of();
         }
@@ -603,6 +692,19 @@ public final class Restyler {
             pending = null;
         }
         stage = Stage.IDLE;
+        if (syncPartial()) {
+            try {
+                if (frameSyncPartial(main, cx, cy, cw, ch, fw, fh)) {
+                    return;
+                }
+            } catch (Throwable t) {
+                LOG.error("Restyler: partial update (quality mode) failed, back to full repaints", t);
+                syncPartialFailed = true;
+                stab.endFrame();
+                say("Restyler: partial update failed (" + t + ") - repainting the full frame again. Send me the log.",
+                        false);
+            }
+        }
         try {
             if (frameCounter++ % runEveryNFrames == 0 || !haveOutput) {
                 long t0 = System.nanoTime();
@@ -637,8 +739,13 @@ public final class Restyler {
     // ------------------------------------------------------------
 
     /** WorldRenderEvents.END (world drawn, hand not yet): camera + depth -> distances. */
+    /** Quality mode (synchronous) with partial update: needs the depth / camera passes too. */
+    private boolean syncPartial() {
+        return !async && partialUpdate && partialModel && !syncPartialFailed;
+    }
+
     public void onWorldEnd(Matrix4f proj, Matrix4f view, double x, double y, double z) {
-        if (!enabled || !async || session == null) {
+        if (!enabled || !(async || syncPartial()) || session == null) {
             return;
         }
         try {
@@ -650,7 +757,7 @@ public final class Restyler {
 
     /** End of GameRenderer.renderWorld (hand drawn, GUI not yet): hand mask for the stabilizer. */
     public void afterHand() {
-        if (!enabled || !async || session == null) {
+        if (!enabled || !(async || syncPartial()) || session == null) {
             return;
         }
         try {
@@ -678,7 +785,10 @@ public final class Restyler {
             float[] style = new float[styleBuf.capacity()];
             styleBuf.get(0, style);
             final float tJob = wet;
-            pending = worker.submit(() -> runJob(style, tJob));
+            final boolean partialOk = partialUpdate && partialModel && stabilizer && stab.hasHistory();
+            final boolean haveRef = capHaveRef;
+            final int fading = fadingMask();
+            pending = worker.submit(() -> runJob(style, tJob, partialOk, haveRef, fading));
             stage = Stage.RUNNING;
         }
         // 2. network finished -> blend into the history
@@ -691,8 +801,9 @@ public final class Restyler {
             }
             pending = null;
             stage = Stage.IDLE;
-            if (rgba != null) {
-                stab.addResult(main, rgba, wLut.rewind(), crop, stabilizer ? stabNew : 1f, stabilizer);
+            boolean added = integrateResult(main, rgba, stabilizer ? stabNew : 1f, stabilizer);
+            afterJob();
+            if (added) {
                 long now = System.nanoTime();
                 if (lastResultNs > 0) {
                     double hz = 1e9 / (now - lastResultNs);
@@ -705,29 +816,261 @@ public final class Restyler {
         }
         // 3. nothing in flight -> capture this frame
         if (stage == Stage.IDLE) {
+            stab.captureDist(main, crop);          // distances + camera first: the dirty mask needs them
             captureAsync(main, cx, cy, cw, ch);
-            stab.captureDist(main, crop);
             stage = Stage.READBACK;
         }
         long t1 = System.nanoTime();
         tAdd(0, (t1 - t0) / 1e6);
 
         // 4. every frame: the look, re-projected to where the camera is now
-        stab.show(main, cx, cy, cw, ch, crop, strength, stabilizer, detail, texelSnap);
+        stepFades(main);
+        float focus = stepReveal(main);
+        stab.show(main, cx, cy, cw, ch, crop, strength, stabilizer, detail, focus, debugView);
         stab.endFrame();
         tAdd(3, (System.nanoTime() - t1) / 1e6);
 
         if (frameCounter++ % 600 == 1) {
             LOG.info(String.format(Locale.ROOT,
                     "Restyler timing (ms): render thread %.1f | network %.1f | post %.1f | show %.1f | look %.1fx/s "
-                            + "(%s, %dx%d, stabilizer %s, wet %.2f)",
-                    tAvg[0], tAvg[1], tAvg[2], tAvg[3], resultHz, provider, fw, fh, stabilizer ? "on" : "off", wet));
+                            + "| repainted %.0f %% per run, %.0f %% of runs unchanged | sharp %.0f %% "
+                            + "(%s, %dx%d, partial %s, wet %.2f)",
+                    tAvg[0], tAvg[1], tAvg[2], tAvg[3], resultHz, areaEma * 100, skipEma * 100,
+                    sharpFrac * 100, provider, fw, fh, partialModel && partialUpdate ? "on" : "off", wet));
+        }
+    }
+
+    /**
+     * QUALITY mode + partial update. Like Performance mode, but the frame waits for the network: capture, find what
+     * changed, repaint just that (or nothing), keep the rest from the previous output moved along with the camera.
+     * Returns false on the first frame (no depth yet) -> the normal full repaint draws it.
+     */
+    private boolean frameSyncPartial(Framebuffer main, int cx, int cy, int cw, int ch, int fw, int fh) throws Exception {
+        crop[0] = cx / (float) fw;
+        crop[1] = cy / (float) fh;
+        crop[2] = cw / (float) fw;
+        crop[3] = ch / (float) fh;
+        if (!stab.ready(main)) {
+            stab.endFrame();
+            return false;
+        }
+        long t0 = System.nanoTime();
+        stab.captureDist(main, crop);
+        blitToSmall(main, cx, cy, cw, ch);
+        stab.markDirty(main, smallFbo, crop, DIRTY_THRESH);
+        wantRef(cw, ch);
+        GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, smallFbo);
+        GlStateManager._pixelStore(GL11.GL_PACK_ROW_LENGTH, 0);
+        GlStateManager._pixelStore(GL11.GL_PACK_SKIP_ROWS, 0);
+        GlStateManager._pixelStore(GL11.GL_PACK_SKIP_PIXELS, 0);
+        GlStateManager._pixelStore(GL11.GL_PACK_ALIGNMENT, 4);
+        readBuf.clear();
+        GL11.glReadPixels(0, 0, W, H, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, readBuf);
+        readRefine(main, cx, cy, cw, ch, false);
+        main.beginWrite(true);
+        readBuf.get(0, capBytes);
+        long t1 = System.nanoTime();
+
+        updateStyle();
+        float[] style = new float[styleBuf.capacity()];
+        styleBuf.get(0, style);
+        ByteBuffer rgba = runJob(style, wet, stab.hasHistory(), capHaveRef, fadingMask());
+        boolean added = integrateResult(main, rgba, 1f, true);
+        afterJob();
+        if (added) {
+            tAdd(1, tNetNs / 1e6);
+            tAdd(2, tPostNs / 1e6);
+        } else {
+            tAdd(1, 0);
+            tAdd(2, 0);
+        }
+        tAdd(0, (t1 - t0) / 1e6);
+        long t2 = System.nanoTime();
+        stepFades(main);
+        float focus = stepReveal(main);
+        stab.show(main, cx, cy, cw, ch, crop, strength, true, 0f, focus, debugView);   // no detail layer: like the normal quality mode
+        stab.endFrame();
+        tAdd(3, (System.nanoTime() - t2) / 1e6);
+        if (frameCounter++ % 600 == 1) {
+            LOG.info(String.format(Locale.ROOT,
+                    "Restyler timing (ms, quality + partial): capture %.1f | network %.1f | post %.1f | show %.1f "
+                            + "| total %.1f | repainted %.0f %% per frame, %.0f %% of frames unchanged | sharp %.0f %% "
+                            + "(%s, %dx%d, wet %.2f)",
+                    tAvg[0], tAvg[1], tAvg[2], tAvg[3], frameMs(), areaEma * 100, skipEma * 100,
+                    sharpFrac * 100, provider, fw, fh, wet));
+        }
+        return true;
+    }
+
+    /** Render thread, at capture: bring the 1280x720 version along? (the worker picks the tile to sharpen) */
+    private void wantRef(int cw, int ch) {
+        // not in WetCraft: at 2.5x its big puddles turn into small glints - keep it as it is
+        capHaveRef = sharpen && partialUpdate && partialModel && wet <= 0.3f && cw >= REF_W && ch >= REF_H
+                && stab.hasHistory();
+    }
+
+    /** The screen crop at 1280x720 (2.5x the network's normal input) -> PBO or refBytes. */
+    private void readRefine(Framebuffer main, int cx, int cy, int cw, int ch, boolean toPbo) {
+        if (!capHaveRef) {
+            return;
+        }
+        if (refFbo < 0) {
+            int[] t = createTarget(REF_W, REF_H);
+            refFbo = t[0];
+            refTex = t[1];
+        }
+        GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, main.fbo);
+        GL30.glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER, refFbo);
+        GL30.glBlitFramebuffer(cx, cy, cx + cw, cy + ch, 0, 0, REF_W, REF_H, GL11.GL_COLOR_BUFFER_BIT, GL11.GL_LINEAR);
+        GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, refFbo);
+        if (toPbo) {
+            if (pbo2 < 0) {
+                pbo2 = GL15.glGenBuffers();
+                GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, pbo2);
+                GL15.glBufferData(GL21.GL_PIXEL_PACK_BUFFER, (long) REF_W * REF_H * 4, GL15.GL_STREAM_READ);
+            }
+            GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, pbo2);
+            GL11.glReadPixels(0, 0, REF_W, REF_H, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, 0L);
+            GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, 0);
+        } else {
+            refReadBuf.clear();
+            GL11.glReadPixels(0, 0, REF_W, REF_H, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, refReadBuf);
+            refReadBuf.get(0, refBytes);
+        }
+    }
+
+    /** Tiles that are fading in right now (the worker must not pick them again). */
+    private int fadingMask() {
+        if (revealStartNs >= 0) {
+            return (1 << 12) - 1;    // focusing right now: no new tiles until it's done
+        }
+        int m = 0;
+        for (int t = 0; t < fadeP.length; t++) {
+            if (fadeP[t] >= 0f) {
+                m |= 1 << t;
+            }
+        }
+        return m;
+    }
+
+    private static float[] uvGl(int x0, int y0, int x1, int y1) {   // top-down px -> 0..1 GL (y up)
+        return new float[]{x0 / (float) W, (H - y1) / (float) H, x1 / (float) W, (H - y0) / (float) H};
+    }
+
+    /** Render thread: a finished job into the history. False = nothing was added. */
+    private boolean integrateResult(Framebuffer main, ByteBuffer rgba, float alpha, boolean reproject) {
+        if (rgba == null) {
+            return false;
+        }
+        int refT = jobRefTile;
+        float[] region = jobRegion;
+        if ((refT >= 0 || region != null) && !stab.hasHistory()) {
+            forceFull = true;     // the history was reset meanwhile: this piece has nothing to fit into
+            return false;
+        }
+        if (refT >= 0) {
+            int[] r = jobRefRect;
+            int tx = refT % RT_X, ty = refT / RT_X;
+            float[] rect = uvGl(r[0], r[1], r[2], r[3]);
+            float[] inner = uvGl(tx * RT_W, ty * RT_H, (tx + 1) * RT_W, (ty + 1) * RT_H);
+            // into the STAGE (not on screen yet): it appears with all the others in one slow focus pull
+            stab.addRefine(main, rgba, jobRefW2, jobRefH2, rect, inner, crop, refT, 0f, false);
+            if (stagedSinceNs < 0) {
+                stagedSinceNs = System.nanoTime();
+            }
+            return true;
+        }
+        finishFades(main);       // the picture moves with this result: running fades finish now (nothing is lost)
+        stab.addResult(main, rgba, region == null ? wLut.rewind() : null, crop, alpha, reproject, region, jobKeepSharp);
+        if (region == null && !jobKeepSharp) {   // everything repainted at 1x (style change ...): nothing staged
+            stagedSinceNs = -1;
+            revealStartNs = -1;
+        }
+        return true;
+    }
+
+    /** After every job: no tile left to sharpen and something staged -> focus now. */
+    private void afterJob() {
+        if (stagedSinceNs < 0 || revealStartNs >= 0) {
+            return;
+        }
+        int left = jobRefTile >= 0 ? jobCandidates - 1 : jobCandidates;
+        if (left <= 0) {
+            revealStartNs = System.nanoTime();
+        }
+    }
+
+    /**
+     * Every frame: the focus pull progress (smoothstep 0..1). The staged 2.5x paint's low band (shape, colour, light)
+     * fades in with it; its fine detail with it^2.5, because seeing detail is compressive (roughly the square root of
+     * its contrast): linear would show most of the change in the first ~20 % - an "event".
+     */
+    private float stepReveal(Framebuffer main) {
+        if (stagedSinceNs < 0 || !stab.hasHistory()) {
+            stagedSinceNs = -1;
+            revealStartNs = -1;
+            return 0f;
+        }
+        long now = System.nanoTime();
+        if (revealStartNs < 0 && now - stagedSinceNs > REVEAL_WAIT_NS) {
+            revealStartNs = now;     // moving: don't keep the sharp parts waiting forever
+        }
+        if (revealStartNs < 0) {
+            return 0f;
+        }
+        float p = Math.min(1f, (now - revealStartNs) / (float) REVEAL_NS);
+        if (p >= 1f) {
+            stab.commit(main);       // staged detail -> history, sharp
+            revealStartNs = -1;
+            stagedSinceNs = -1;
+            return 1f;
+        }
+        return p * p * (3f - 2f * p);   // the show shader: low band x this, detail x this^2.5
+    }
+
+    /** Every frame: sharpened tiles fade in (current look -> 2.5x) over FADE_NS. */
+    private void stepFades(Framebuffer main) {
+        long now = System.nanoTime();
+        for (int t = 0; t < fadeP.length; t++) {
+            float p0 = fadeP[t];
+            if (p0 < 0f) {
+                continue;
+            }
+            if (!stab.hasHistory()) {
+                fadeP[t] = -1f;
+                continue;
+            }
+            float p1 = Math.min(1f, (now - fadeStart[t]) / (float) FADE_NS);
+            p1 = p1 * p1 * (3f - 2f * p1);            // smooth start and end
+            if (p1 > p0) {
+                float a = (p1 - p0) / (1f - p0);      // linear blend step from what is there now
+                stab.fadeRefine(main, t, fadeW2[t], fadeH2[t], fadeRect[t], fadeInner[t], crop, a, p1 >= 1f);
+                fadeP[t] = p1;
+            }
+            if (p1 >= 1f) {
+                fadeP[t] = -1f;
+            }
+        }
+    }
+
+    /** Before the history moves (new result): finish every running fade at once, still in the right place. */
+    private void finishFades(Framebuffer main) {
+        for (int t = 0; t < fadeP.length; t++) {
+            if (fadeP[t] >= 0f) {
+                if (stab.hasHistory()) {
+                    stab.fadeRefine(main, t, fadeW2[t], fadeH2[t], fadeRect[t], fadeInner[t], crop, 1f, true);
+                }
+                fadeP[t] = -1f;
+            }
         }
     }
 
     /** crop -> 1024x576 -> 512x288 on the GPU, then glReadPixels into a PBO: returns at once, no stall. */
     private void captureAsync(Framebuffer main, int cx, int cy, int cw, int ch) {
         blitToSmall(main, cx, cy, cw, ch);
+        stab.markDirty(main, smallFbo, crop, DIRTY_THRESH);   // alpha: changed / not sharp yet / sharp
+        wantRef(cw, ch);
+        GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, smallFbo);
         if (pbo < 0) {
             pbo = GL15.glGenBuffers();
             GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, pbo);
@@ -740,6 +1083,7 @@ public final class Restyler {
         GlStateManager._pixelStore(GL11.GL_PACK_ALIGNMENT, 4);
         GL11.glReadPixels(0, 0, W, H, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, 0L);
         GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, 0);
+        readRefine(main, cx, cy, cw, ch, true);
         fence = GL32.glFenceSync(GL32.GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
         main.beginWrite(true);
     }
@@ -764,11 +1108,32 @@ public final class Restyler {
             m.get(0, capBytes);
             GL15.glUnmapBuffer(GL21.GL_PIXEL_PACK_BUFFER);
         }
+        if (capHaveRef) {
+            GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, pbo2);
+            ByteBuffer m2 = GL30.glMapBufferRange(GL21.GL_PIXEL_PACK_BUFFER, 0, (long) REF_W * REF_H * 4,
+                    GL30.GL_MAP_READ_BIT);
+            if (m2 != null) {
+                m2.get(0, refBytes);
+                GL15.glUnmapBuffer(GL21.GL_PIXEL_PACK_BUFFER);
+            } else {
+                capHaveRef = false;
+            }
+        }
         GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, 0);
     }
 
-    /** Worker thread: RGBA bottom-up -> network -> post -> RGBA bottom-up (GL row order, ready to upload). */
-    private ByteBuffer runJob(float[] style, float tWet) throws Exception {
+    /**
+     * Worker thread: RGBA bottom-up -> network -> post -> RGBA bottom-up (GL row order, ready to upload).
+     * PARTIAL UPDATE: the capture's alpha says which pixels the history can't supply (new surfaces, or the game's
+     * image changed there). Only the 32 px tiles with enough of those are repainted: the network runs on that
+     * rectangle + MARGIN of context, normalised with the GroupNorm statistics of the last full repaint (so the piece
+     * matches the rest of the picture). Nothing changed -> no network run at all (returns null, jobRegion = null).
+     */
+    private ByteBuffer runJob(float[] style, float tWet, boolean partialOk, boolean haveRef, int fading)
+            throws Exception {
+        jobRegion = null;
+        jobRefTile = -1;
+        jobKeepSharp = false;
         for (int y = 0; y < H; y++) {
             int src = (H - 1 - y) * W * 4;
             int dst = y * W;
@@ -784,43 +1149,163 @@ public final class Restyler {
             wStyle = ByteBuffer.allocateDirect(style.length * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
         }
         wStyle.put(0, style);
+
+        // ---- full or partial?
+        long now = System.nanoTime();
+        boolean styleChanged = wLastStyle == null || wLastStyle.length != style.length;
+        for (int i = 0; !styleChanged && i < style.length; i++) {
+            styleChanged = Math.abs(style[i] - wLastStyle[i]) > 1e-4f;
+        }
+        boolean hardFull = !partialOk || wStats == null || forceFull || styleChanged;   // everything new
+        boolean full = hardFull || wSinceFull >= FULL_EVERY_JOBS;    // routine refresh: keeps sharp pixels
+        jobKeepSharp = !hardFull;
+        int bx0 = 0, by0 = 0, bx1 = W, by1 = H;      // part to repaint, top-down pixels
+        // the capture's alpha: 255 = changed (repaint), 128 = same but not sharp yet, 0 = same and sharp
+        int[] cnt = new int[TILES_X * TILES_Y];
+        int[] rUnsharp = new int[RT_X * RT_Y], rDirty = new int[RT_X * RT_Y];
+        int sharpPx = 0;
+        for (int y = 0; y < H; y++) {                 // GL rows: y = 0 is the bottom
+            int yt = H - 1 - y;
+            int ty = yt / TILE;
+            int row = y * W * 4 + 3;
+            for (int x = 0; x < W; x++) {
+                int a = capBytes[row + x * 4] & 0xFF;
+                int rt = (yt / RT_H) * RT_X + x / RT_W;
+                if (a > 191) {
+                    cnt[ty * TILES_X + x / TILE]++;
+                    rDirty[rt]++;
+                } else if (a > 63) {
+                    rUnsharp[rt]++;
+                } else {
+                    sharpPx++;
+                }
+            }
+        }
+        sharpFrac = sharpPx / (double) PLANE;
+        // best tile to sharpen: unchanged, not fading in, most pixels still at 1x; the centre counts more
+        int refT = -1;
+        int nCand = 0;
+        if (haveRef && sharpen && wStats != null && !hardFull) {
+            double best = 0;
+            for (int t = 0; t < RT_X * RT_Y; t++) {
+                if ((fading & (1 << t)) != 0 || rDirty[t] > RT_W * RT_H / 50 || rUnsharp[t] < RT_W * RT_H / 8) {
+                    continue;
+                }
+                nCand++;
+                double dx = ((t % RT_X) + 0.5) / RT_X - 0.5, dy = ((t / RT_X) + 0.5) / RT_Y - 0.5;
+                double score = rUnsharp[t] * (1.5 - Math.sqrt(dx * dx + dy * dy));
+                if (score > best) {
+                    best = score;
+                    refT = t;
+                }
+            }
+        }
+        jobCandidates = nCand;
+        if (!full) {
+            bx0 = W;
+            by0 = H;
+            bx1 = 0;
+            by1 = 0;
+            int need = (int) (TILE * TILE * DIRTY_FRAC);
+            for (int ty = 0; ty < TILES_Y; ty++) {
+                for (int tx = 0; tx < TILES_X; tx++) {
+                    if (cnt[ty * TILES_X + tx] > need) {
+                        bx0 = Math.min(bx0, tx * TILE);
+                        by0 = Math.min(by0, ty * TILE);
+                        bx1 = Math.max(bx1, (tx + 1) * TILE);
+                        by1 = Math.max(by1, (ty + 1) * TILE);
+                    }
+                }
+            }
+            if (bx1 <= bx0) {                         // nothing changed: the history is still right ...
+                skipEma = 0.9 * skipEma + 0.1;
+                wLastWasPartial = false;
+                return refT >= 0 ? runRefine(refT) : null;   // ... so spend the time on sharpening
+            }
+            boolean small = (bx1 - bx0) * (by1 - by0) < SHARPEN_MAX_CHANGE * PLANE;
+            if (small && refT >= 0 && wLastWasPartial) {      // little changes: alternate repaint / sharpen
+                wLastWasPartial = false;
+                return runRefine(refT);
+            }
+            wLastWasPartial = true;
+            if ((bx1 - bx0) * (by1 - by0) > FULL_AREA * PLANE) {
+                full = true;
+                bx0 = 0;
+                by0 = 0;
+                bx1 = W;
+                by1 = H;
+            }
+        }
+        skipEma = 0.9 * skipEma;
+
         long n0;
         long n1;
         synchronized (sessionLock) {
             if (session == null) {
                 return null;   // model is being switched
             }
-            Map<String, OnnxTensor> feeds = new HashMap<>();
-            try (OnnxTensor frame = OnnxTensor.createTensor(env, wIn.rewind(), new long[]{1, 3, H, W});
-                 OnnxTensor st = OnnxTensor.createTensor(env, wStyle.rewind(), new long[]{1, style.length})) {
-                feeds.put(frameName, frame);
-                feeds.put(styleName, st);
+            if (full) {
                 n0 = System.nanoTime();
-                try (OrtSession.Result result = session.run(feeds)) {
-                    n1 = System.nanoTime();
-                    if (profile && ++profiledRuns == 300) {
-                        LOG.info("Restyler: ONNX layer profile written to {}", session.endProfiling());
-                        profile = false;
-                    }
-                    FloatBuffer out = ((OnnxTensor) result.get(0)).getFloatBuffer();
-                    for (int i = 0; i < 3 * PLANE; i++) {
-                        float v = out.get(i);
-                        wOut[i] = v >= 0f ? (v > 1f ? 1f : v) : 0f;   // NaN -> 0
+                float[] out = run(wIn.rewind(), H, W, 0f);
+                n1 = System.nanoTime();
+                for (int i = 0; i < 3 * PLANE; i++) {
+                    float v = out[i];
+                    wOut[i] = v >= 0f ? (v > 1f ? 1f : v) : 0f;   // NaN -> 0
+                }
+                wLastFullNs = now;
+                wSinceFull = 0;
+                wLastStyle = style.clone();
+                forceFull = false;
+            } else {
+                // network input: the part + MARGIN of context, sides on multiples of 8 (the U-Net halves 3 times)
+                // sizes rounded up to multiples of 64 x 48: few different shapes, so cuDNN picks its algorithms
+                // once per shape (the first run of a new size is slow - on this background thread that's harmless)
+                int cx0 = Math.max(0, (bx0 - MARGIN) / 8 * 8), cy0 = Math.max(0, (by0 - MARGIN) / 8 * 8);
+                int cx1 = Math.min(W, (bx1 + MARGIN + 7) / 8 * 8), cy1 = Math.min(H, (by1 + MARGIN + 7) / 8 * 8);
+                int cw = Math.min(W, (cx1 - cx0 + 63) / 64 * 64), ch = Math.min(H, (cy1 - cy0 + 47) / 48 * 48);
+                cx0 = Math.min(cx0, W - cw);
+                cy0 = Math.min(cy0, H - ch);
+                cx1 = cx0 + cw;
+                cy1 = cy0 + ch;
+                if (wCrop == null) {
+                    wCrop = ByteBuffer.allocateDirect(3 * PLANE * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
+                }
+                wCrop.clear();
+                for (int c = 0; c < 3; c++) {
+                    for (int y = cy0; y < cy1; y++) {
+                        for (int x = cx0; x < cx1; x++) {
+                            wCrop.put(wIn.get(c * PLANE + y * W + x));
+                        }
                     }
                 }
+                wCrop.flip();
+                n0 = System.nanoTime();
+                float[] out = run(wCrop.slice(), ch, cw, 1f);
+                n1 = System.nanoTime();
+                for (int c = 0; c < 3; c++) {
+                    for (int y = by0; y < by1; y++) {
+                        for (int x = bx0; x < bx1; x++) {
+                            float v = out[c * ch * cw + (y - cy0) * cw + (x - cx0)];
+                            wOut[c * PLANE + y * W + x] = v >= 0f ? (v > 1f ? 1f : v) : 0f;
+                        }
+                    }
+                }
+                wSinceFull++;
             }
         }
-        applyDevignette(wOut, tWet);
-        applyLightLock(wIn, wOut);
+        areaEma = 0.9 * areaEma + 0.1 * ((bx1 - bx0) * (double) (by1 - by0) / PLANE);
+        int[] box = full ? null : new int[]{bx0, by0, bx1, by1};   // post-processing only where repainted
+        applyDevignette(wOut, tWet, box);
+        applyLightLock(wIn, wOut, box);
         if (keepDark) {
-            keepDarkGuard(wIn, wOut);
+            keepDarkGuard(wIn, wOut, box);
         }
         if (dehaze >= 1) {
-            levels(wOut);
+            levels(wOut, full, box);
         }
-        for (int y = 0; y < H; y++) {
+        for (int y = by0; y < by1; y++) {
             int row = (H - 1 - y) * W * 4;
-            for (int x = 0; x < W; x++) {
+            for (int x = bx0; x < bx1; x++) {
                 int o = y * W + x;
                 int i = row + x * 4;
                 wRgba.put(i, (byte) toByte(wOut[o]));
@@ -829,10 +1314,227 @@ public final class Restyler {
                 wRgba.put(i + 3, (byte) 255);
             }
         }
-        buildLut();
+        if (full) {
+            buildLut();
+        } else {   // top-down pixels -> GL 0..1 (y up)
+            jobRegion = new float[]{bx0 / (float) W, (H - by1) / (float) H, bx1 / (float) W, (H - by0) / (float) H};
+        }
         tNetNs = n1 - n0;
         tPostNs = System.nanoTime() - n1;
         return wRgba.rewind();
+    }
+
+    /**
+     * Worker: one tile at 2.5x resolution (the network gets the 1280x720 picture there, normalised with the full
+     * frame's statistics so it fits the rest). Post-processing like the normal path, then the tile (+ fade border)
+     * as RGBA rows bottom-up.
+     */
+    private ByteBuffer runRefine(int t) throws Exception {
+        int ox = Math.max(0, Math.min(REF_W - RC_W, 320 * (t % RT_X) - 88));   // 320 = 128 x 2.5
+        int oy = Math.max(0, Math.min(REF_H - RC_H, 240 * (t / RT_X) - 88));   // 240 = 96 x 2.5
+        int n = RC_W * RC_H;
+        if (wRefIn == null) {
+            wRefIn = ByteBuffer.allocateDirect(3 * n * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
+        }
+        for (int y = 0; y < RC_H; y++) {
+            int src = ((REF_H - 1 - (oy + y)) * REF_W + ox) * 4;   // the 1280x720 frame, GL rows bottom-up
+            for (int x = 0; x < RC_W; x++) {
+                int i = src + x * 4;
+                int o = y * RC_W + x;
+                wRefIn.put(o, (refBytes[i] & 0xFF) / 255f);
+                wRefIn.put(n + o, (refBytes[i + 1] & 0xFF) / 255f);
+                wRefIn.put(2 * n + o, (refBytes[i + 2] & 0xFF) / 255f);
+            }
+        }
+        long n0;
+        long n1;
+        float[] out;
+        synchronized (sessionLock) {
+            if (session == null) {
+                return null;
+            }
+            n0 = System.nanoTime();
+            out = run(wRefIn.rewind(), RC_H, RC_W, 1f);
+            n1 = System.nanoTime();
+        }
+        int tx = t % RT_X, ty = t / RT_X;
+        int ex0 = Math.max(0, tx * RT_W - R_FEATHER), ey0 = Math.max(0, ty * RT_H - R_FEATHER);
+        int ex1 = Math.min(W, (tx + 1) * RT_W + R_FEATHER), ey1 = Math.min(H, (ty + 1) * RT_H + R_FEATHER);
+        int w2 = 5 * (ex1 - ex0) / 2, h2 = 5 * (ey1 - ey0) / 2, m = w2 * h2;   // 2.5x (all sides are even)
+        int x0 = 5 * ex0 / 2 - ox, y0 = 5 * ey0 / 2 - oy;                     // the tile in the network input
+        float[] pr = new float[3 * m];
+        float[] vr = new float[3 * m];
+        for (int c = 0; c < 3; c++) {
+            for (int y = 0; y < h2; y++) {
+                for (int x = 0; x < w2; x++) {
+                    int si = c * n + (y0 + y) * RC_W + (x0 + x);
+                    float v = out[si];
+                    pr[c * m + y * w2 + x] = v >= 0f ? (v > 1f ? 1f : v) : 0f;
+                    vr[c * m + y * w2 + x] = wRefIn.get(si);
+                }
+            }
+        }
+        if (lightLock) {
+            localLightLock(pr, vr, w2, h2, 40);       // 40 px here = the 16 px cells at normal resolution
+        }
+        if (keepDark) {
+            float guard = darkGuard(wIn);
+            if (guard > 0f) {
+                for (int i = 0; i < m; i++) {
+                    float lin = 0.299f * vr[i] + 0.587f * vr[m + i] + 0.114f * vr[2 * m + i];
+                    float lout = 0.299f * pr[i] + 0.587f * pr[m + i] + 0.114f * pr[2 * m + i];
+                    float cap = lin * 1.2f + 0.015f;
+                    float allowed = cap + (1f - guard) * Math.max(0f, lout - cap);
+                    if (lout > allowed && lout > 1e-5f) {
+                        float k = allowed / lout;
+                        pr[i] *= k;
+                        pr[m + i] *= k;
+                        pr[2 * m + i] *= k;
+                    }
+                }
+            }
+        }
+        if (dehaze >= 1 && blackEma >= 0f) {
+            float black = Math.min(blackEma, 0.6f);
+            float gain = 1f / (1f - black);
+            for (int i = 0; i < 3 * m; i++) {
+                float v = (pr[i] - black) * gain;
+                pr[i] = v < 0f ? 0f : (v > 1f ? 1f : v);
+            }
+        }
+        for (int y = 0; y < h2; y++) {
+            int row = (h2 - 1 - y) * w2;
+            for (int x = 0; x < w2; x++) {
+                int o = y * w2 + x;
+                int i = (row + x) * 4;
+                wRefRgba.put(i, (byte) toByte(pr[o]));
+                wRefRgba.put(i + 1, (byte) toByte(pr[m + o]));
+                wRefRgba.put(i + 2, (byte) toByte(pr[2 * m + o]));
+                wRefRgba.put(i + 3, (byte) 255);
+            }
+        }
+        jobRefW2 = w2;
+        jobRefH2 = h2;
+        jobRefRect = new int[]{ex0, ey0, ex1, ey1};
+        jobRefTile = t;
+        tNetNs = n1 - n0;
+        tPostNs = System.nanoTime() - n1;
+        return wRefRgba.rewind();
+    }
+
+    /** Light lock on a w x h picture (planes): per cs x cs cell, brightness within lockMin..lockMax x vanilla. */
+    private void localLightLock(float[] p, float[] v, int w, int h, int cs) {
+        int nx = (w + cs - 1) / cs, ny = (h + cs - 1) / cs, m = w * h;
+        float eps = 0.02f;
+        float[] g = new float[nx * ny];
+        for (int cy = 0; cy < ny; cy++) {
+            for (int cx = 0; cx < nx; cx++) {
+                double li = 0, lo = 0;
+                int cnt = 0;
+                for (int y = cy * cs; y < Math.min(h, (cy + 1) * cs); y++) {
+                    for (int x = cx * cs; x < Math.min(w, (cx + 1) * cs); x++) {
+                        int o = y * w + x;
+                        li += 0.299f * v[o] + 0.587f * v[m + o] + 0.114f * v[2 * m + o];
+                        lo += 0.299f * p[o] + 0.587f * p[m + o] + 0.114f * p[2 * m + o];
+                        cnt++;
+                    }
+                }
+                double r = (lo / cnt + eps) / (li / cnt + eps);
+                double rc = Math.max(lockMin, Math.min(lockMax, r));
+                g[cy * nx + cx] = (float) (Math.log(rc / r) / Math.log(2.0));
+            }
+        }
+        for (int y = 0; y < h; y++) {
+            float fy = (y + 0.5f) / cs - 0.5f;
+            int ya = Math.max(0, Math.min(ny - 1, (int) Math.floor(fy)));
+            int yb = Math.min(ny - 1, ya + 1);
+            float wy = Math.max(0f, Math.min(1f, fy - ya));
+            for (int x = 0; x < w; x++) {
+                float fx = (x + 0.5f) / cs - 0.5f;
+                int xa = Math.max(0, Math.min(nx - 1, (int) Math.floor(fx)));
+                int xb = Math.min(nx - 1, xa + 1);
+                float wx = Math.max(0f, Math.min(1f, fx - xa));
+                float top = g[ya * nx + xa] * (1 - wx) + g[ya * nx + xb] * wx;
+                float bot = g[yb * nx + xa] * (1 - wx) + g[yb * nx + xb] * wx;
+                float gain = (float) Math.pow(2.0, top * (1 - wy) + bot * wy);
+                int o = y * w + x;
+                for (int c = 0; c < 3; c++) {
+                    float q = p[c * m + o] * gain;
+                    p[c * m + o] = q > 1f ? 1f : q;
+                }
+            }
+        }
+    }
+
+    /** Keep dark: 1 = dark frame (no brightening allowed), 0 = day. */
+    private static float darkGuard(FloatBuffer in) {
+        double sum = 0;
+        for (int o = 0; o < PLANE; o += 7) {
+            sum += 0.299f * in.get(o) + 0.587f * in.get(PLANE + o) + 0.114f * in.get(2 * PLANE + o);
+        }
+        float mean = (float) (sum / ((PLANE + 6) / 7));
+        return Math.max(0f, Math.min(1f, (0.25f - mean) / (0.25f - 0.08f)));
+    }
+
+    /**
+     * One network run on a [1,3,h,w] frame (worker, under sessionLock). Partial models also get / give the GroupNorm
+     * statistics: use = 0 measures them (stored for later partial runs), use = 1 normalises with the stored ones.
+     */
+    private float[] run(FloatBuffer frame, int h, int w, float use) throws Exception {
+        Map<String, OnnxTensor> feeds = new HashMap<>();
+        java.util.List<OnnxTensor> made = new java.util.ArrayList<>();
+        try {
+            OnnxTensor f = OnnxTensor.createTensor(env, frame, new long[]{1, 3, h, w});
+            made.add(f);
+            feeds.put(frameName, f);
+            OnnxTensor st = OnnxTensor.createTensor(env, wStyle.rewind(), new long[]{1, wStyle.capacity()});
+            made.add(st);
+            feeds.put(styleName, st);
+            if (partialModel) {
+                if (wStatsBuf == null) {
+                    wStatsBuf = ByteBuffer.allocateDirect(statsRows * 8 * 4).order(ByteOrder.nativeOrder())
+                            .asFloatBuffer();
+                }
+                wStatsBuf.clear();
+                if (wStats != null) {
+                    wStatsBuf.put(wStats);
+                } else {
+                    wStatsBuf.put(new float[statsRows * 8]);
+                }
+                wStatsBuf.flip();
+                OnnxTensor ns = OnnxTensor.createTensor(env, wStatsBuf, new long[]{statsRows, 8});
+                made.add(ns);
+                feeds.put("norm_stats", ns);
+                FloatBuffer u = ByteBuffer.allocateDirect(4).order(ByteOrder.nativeOrder()).asFloatBuffer();
+                u.put(0, use);
+                OnnxTensor ut = OnnxTensor.createTensor(env, u, new long[]{1});
+                made.add(ut);
+                feeds.put("use_stats", ut);
+            }
+            try (OrtSession.Result result = session.run(feeds)) {
+                if (profile && ++profiledRuns == 300) {
+                    LOG.info("Restyler: ONNX layer profile written to {}", session.endProfiling());
+                    profile = false;
+                }
+                FloatBuffer ob = ((OnnxTensor) result.get(0)).getFloatBuffer();
+                float[] out = new float[3 * h * w];
+                ob.get(out);
+                if (partialModel && use == 0f) {
+                    java.util.Optional<ai.onnxruntime.OnnxValue> so = result.get("norm_stats_out");
+                    if (so.isPresent()) {
+                        FloatBuffer sb = ((OnnxTensor) so.get()).getFloatBuffer();
+                        float[] stats = new float[statsRows * 8];
+                        sb.get(stats);
+                        wStats = stats;
+                    }
+                }
+                return out;
+            }
+        } finally {
+            for (OnnxTensor t : made) {
+                t.close();
+            }
+        }
     }
 
     /**
@@ -1014,6 +1716,10 @@ public final class Restyler {
              OnnxTensor style = OnnxTensor.createTensor(env, styleBuf.rewind(), new long[]{1, styleBuf.capacity()})) {
             feeds.put(frameName, frame);
             feeds.put(styleName, style);
+            if (partialModel) {   // full frame, measure its own statistics
+                feeds.put("norm_stats", OnnxTensor.createTensor(env, new float[statsRows][8]));
+                feeds.put("use_stats", OnnxTensor.createTensor(env, new float[]{0f}));
+            }
             long n0 = System.nanoTime();
             try (OrtSession.Result result = session.run(feeds)) {
                 long n1 = System.nanoTime();
@@ -1024,6 +1730,11 @@ public final class Restyler {
                 fillOutput(((OnnxTensor) result.get(0)).getFloatBuffer());
                 tNetNs = n1 - n0;
                 tPostNs = System.nanoTime() - n1;
+            } finally {
+                if (partialModel) {
+                    feeds.get("norm_stats").close();
+                    feeds.get("use_stats").close();
+                }
             }
         }
     }
@@ -1060,6 +1771,10 @@ public final class Restyler {
      * at most 1.2x + a little. Bright daytime frames are not affected.
      */
     private static void keepDarkGuard(FloatBuffer inputBuf, float[] rgbOut) {
+        keepDarkGuard(inputBuf, rgbOut, null);
+    }
+
+    private static void keepDarkGuard(FloatBuffer inputBuf, float[] rgbOut, int[] box) {
         double sum = 0;
         for (int o = 0; o < PLANE; o += 7) {
             sum += 0.299f * inputBuf.get(o) + 0.587f * inputBuf.get(PLANE + o) + 0.114f * inputBuf.get(2 * PLANE + o);
@@ -1069,7 +1784,10 @@ public final class Restyler {
         if (guard <= 0f) {
             return;
         }
-        for (int o = 0; o < PLANE; o++) {
+        int xa = box == null ? 0 : box[0], xb = box == null ? W : box[2];
+        int ya = box == null ? 0 : box[1], yb = box == null ? H : box[3];
+        for (int yy = ya; yy < yb; yy++) for (int xx = xa; xx < xb; xx++) {
+            int o = yy * W + xx;
             float lin = 0.299f * inputBuf.get(o) + 0.587f * inputBuf.get(PLANE + o) + 0.114f * inputBuf.get(2 * PLANE + o);
             float lout = 0.299f * rgbOut[o] + 0.587f * rgbOut[PLANE + o] + 0.114f * rgbOut[2 * PLANE + o];
             float cap = lin * 1.2f + 0.015f;
@@ -1085,6 +1803,31 @@ public final class Restyler {
 
     /** Stretch the darkest 1 % (smoothed over frames, no flicker) back to black. */
     private void levels(float[] rgbOut) {
+        levels(rgbOut, true);
+    }
+
+    /** measure = false: keep the current black point (partial repaints must match the rest of the picture). */
+    private void levels(float[] rgbOut, boolean measure) {
+        levels(rgbOut, measure, null);
+    }
+
+    private void levels(float[] rgbOut, boolean measure, int[] box) {
+        if (!measure && blackEma >= 0f) {
+            float black = Math.min(blackEma, 0.6f);
+            float gain = 1f / (1f - black);
+            int xa = box == null ? 0 : box[0], xb = box == null ? W : box[2];
+            int ya = box == null ? 0 : box[1], yb = box == null ? H : box[3];
+            for (int c = 0; c < 3; c++) {
+                for (int y = ya; y < yb; y++) {
+                    for (int x = xa; x < xb; x++) {
+                        int i = c * PLANE + y * W + x;
+                        float v = (rgbOut[i] - black) * gain;
+                        rgbOut[i] = v < 0f ? 0f : (v > 1f ? 1f : v);
+                    }
+                }
+            }
+            return;
+        }
         java.util.Arrays.fill(hist, 0);
         for (int o = 0; o < PLANE; o++) {
             float l = 0.299f * rgbOut[o] + 0.587f * rgbOut[PLANE + o] + 0.114f * rgbOut[2 * PLANE + o];
@@ -1217,6 +1960,10 @@ public final class Restyler {
 
     /** out /= 2^bias(x, y): bias bilinear from the 32x18 grid, normal/wet maps mixed by t. */
     private void applyDevignette(float[] out, float t) {
+        applyDevignette(out, t, null);
+    }
+
+    private void applyDevignette(float[] out, float t, int[] box) {
         float[] vn = vigNormal, vw = vigWet;
         if (!devignette || vn == null) {
             return;
@@ -1225,7 +1972,7 @@ public final class Restyler {
         for (int i = 0; i < cell.length; i++) {
             cell[i] = -((1f - t) * vn[i] + t * vw[i]);
         }
-        applyCellLog2(out, cell);
+        applyCellLog2(out, cell, box);
     }
 
     /**
@@ -1234,14 +1981,21 @@ public final class Restyler {
      * can't light the cave like a flashlight held by the player.
      */
     private void applyLightLock(FloatBuffer in, float[] out) {
+        applyLightLock(in, out, null);
+    }
+
+    /** box = {x0, y0, x1, y1} (top-down px) of a partial repaint: cells outside copy the nearest inside cell. */
+    private void applyLightLock(FloatBuffer in, float[] out, int[] box) {
         if (!lightLock) {
             return;
         }
         final int cw = W / VIG_GX, ch = H / VIG_GY;   // 16 x 16
         final float eps = 0.02f;
         float[] cell = new float[VIG_GX * VIG_GY];
-        for (int cy = 0; cy < VIG_GY; cy++) {
-            for (int cx = 0; cx < VIG_GX; cx++) {
+        int gxa = box == null ? 0 : box[0] / cw, gxb = box == null ? VIG_GX : (box[2] + cw - 1) / cw;
+        int gya = box == null ? 0 : box[1] / ch, gyb = box == null ? VIG_GY : (box[3] + ch - 1) / ch;
+        for (int cy = gya; cy < gyb; cy++) {
+            for (int cx = gxa; cx < gxb; cx++) {
                 double li = 0, lo = 0;
                 for (int y = cy * ch; y < (cy + 1) * ch; y++) {
                     int o = y * W + cx * cw;
@@ -1256,18 +2010,34 @@ public final class Restyler {
                 cell[cy * VIG_GX + cx] = (float) (Math.log(rc / r) / Math.log(2.0));
             }
         }
-        applyCellLog2(out, cell);
+        if (box != null) {   // no seam at the edge of the repainted part: outside cells = nearest inside cell
+            int gx0 = box[0] / cw, gy0 = box[1] / ch, gx1 = (box[2] - 1) / cw, gy1 = (box[3] - 1) / ch;
+            for (int cy = 0; cy < VIG_GY; cy++) {
+                for (int cx = 0; cx < VIG_GX; cx++) {
+                    int sx = Math.max(gx0, Math.min(gx1, cx)), sy = Math.max(gy0, Math.min(gy1, cy));
+                    cell[cy * VIG_GX + cx] = cell[sy * VIG_GX + sx];
+                }
+            }
+        }
+        applyCellLog2(out, cell, box);
     }
 
     /** out *= 2^cell(x, y), cell bilinear from the 32x18 grid; clamps to 1. */
     private static void applyCellLog2(float[] out, float[] cell) {
+        applyCellLog2(out, cell, null);
+    }
+
+    /** box = {x0, y0, x1, y1} (top-down px): only there (partial repaint), null = everywhere. */
+    private static void applyCellLog2(float[] out, float[] cell, int[] box) {
+        int xa = box == null ? 0 : box[0], xb = box == null ? W : box[2];
+        int ya = box == null ? 0 : box[1], yb = box == null ? H : box[3];
         float[] rowGain = new float[W];
-        for (int y = 0; y < H; y++) {
+        for (int y = ya; y < yb; y++) {
             float fy = (y + 0.5f) * VIG_GY / H - 0.5f;
             int y0 = Math.max(0, Math.min(VIG_GY - 1, (int) Math.floor(fy)));
             int y1 = Math.min(VIG_GY - 1, y0 + 1);
             float wy = Math.max(0f, Math.min(1f, fy - y0));
-            for (int x = 0; x < W; x++) {
+            for (int x = xa; x < xb; x++) {
                 float fx = (x + 0.5f) * VIG_GX / W - 0.5f;
                 int x0 = Math.max(0, Math.min(VIG_GX - 1, (int) Math.floor(fx)));
                 int x1 = Math.min(VIG_GX - 1, x0 + 1);
@@ -1279,7 +2049,7 @@ public final class Restyler {
             int o = y * W;
             for (int c = 0; c < 3; c++) {
                 int base = c * PLANE + o;
-                for (int x = 0; x < W; x++) {
+                for (int x = xa; x < xb; x++) {
                     float v = out[base + x] * rowGain[x];
                     out[base + x] = v > 1f ? 1f : v;
                 }
@@ -1304,7 +2074,7 @@ public final class Restyler {
         }
         loadFailed = true;   // until proven otherwise
 
-        // first start: fetch the model + style vectors (a few MB), then continue
+        // first start: fetch the model + style vectors (~11 MB), then continue
         if (!ModelFetcher.present(dir) && pickModel() == null) {
             if (ModelFetcher.configured()) {
                 startModelDownload(mc);
@@ -1319,6 +2089,12 @@ public final class Restyler {
                     + "snowfilter-0.1.0.jar, otherwise both restyle the same frame (and both use K)", false);
         }
         Path model = pickModel();
+        if (model != null) {   // same network + partial-update inputs (make_partial.py): use it when it's there
+            Path partial = model.resolveSibling(model.getFileName().toString().replace(".onnx", "_partial.onnx"));
+            if (Files.exists(partial)) {
+                model = partial;
+            }
+        }
         if (model == null) {
             say("Restyler: copy restyler_v3_epXX.onnx and styles.json (from v3_out) into " + dir
                     + ", then press K twice", false);
@@ -1382,20 +2158,27 @@ public final class Restyler {
         try {
             frameName = null;
             styleName = null;
+            partialModel = false;
             for (String n : session.getInputNames()) {
                 if (n.equals("style")) {
                     styleName = n;
-                } else if (frameName == null) {
+                } else if (n.equals("norm_stats")) {
+                    partialModel = true;
+                    long[] shape = ((ai.onnxruntime.TensorInfo) session.getInputInfo().get(n).getInfo()).getShape();
+                    statsRows = (int) shape[0];
+                } else if (!n.equals("use_stats") && (frameName == null || n.equals("frame"))) {
                     frameName = n;
                 }
             }
+            wStats = null;
+            forceFull = true;
             if (styleName == null || frameName == null) {
                 say("Restyler: " + model.getFileName() + " is not a style model (inputs " + session.getInputNames()
                         + "). Use restyler_v3_epXX.onnx.", false);
                 closeSession();
                 return false;
             }
-            loadedModelName = model.getFileName().toString();
+            loadedModelName = model.getFileName().toString().replace("_partial.onnx", ".onnx");
             if (outputTex == null) {
                 outputTex = new NativeImageBackedTexture(new NativeImage(NativeImage.Format.RGBA, W, H, false));
                 outputTex.setFilter(true, false);   // smooth when stretched to full screen
@@ -1440,7 +2223,7 @@ public final class Restyler {
 
     private void startModelDownload(MinecraftClient mc) {
         modelDownloading = true;
-        say("Restyler: first start - downloading the model (a few MB)...", true);
+        say("Restyler: first start - downloading the model (~11 MB)...", true);
         Thread t = new Thread(() -> {
             try {
                 ModelFetcher.download(dir, msg -> mc.execute(() -> say(msg, true)));

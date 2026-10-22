@@ -27,6 +27,8 @@ final class ModelFetcher {
     static final String MODEL = "restyler_v3_ep60.onnx";
     static final String[][] FILES = {
             {MODEL, "996f916a007c7be6c974234810e23e87cdbae2917ef80f03504cd3f6129ce692"},   // file name, sha256
+            {"restyler_v3_ep60_partial.onnx",   // same network + partial-update inputs (Partial / Sharpen)
+                    "63b1bb6ca37bfc238d246a027f93f44f263433f94db36e24934285b0fdc625ef"},
             {"styles.json", "2552531dba5216fdaf356987d4491709bd0690da6017c8223b4c2bed7bf6fe57"},
     };
 

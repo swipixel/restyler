@@ -18,6 +18,7 @@ import org.lwjgl.glfw.GLFW;
  * /restyler                      status
  * /restyler look auto|normal|wet
  * /restyler model [file.onnx]    switch network (no file = newest restyler_v3_epXX.onnx)
+ * /restyler debug                colour what is cached (green sharp, blue waiting, yellow 1x, red not)
  */
 public class RestylerClient implements ClientModInitializer {
 
@@ -53,6 +54,13 @@ public class RestylerClient implements ClientModInitializer {
                                 .then(ClientCommandManager.literal("auto").executes(ctx -> look(r, Restyler.Look.AUTO)))
                                 .then(ClientCommandManager.literal("normal").executes(ctx -> look(r, Restyler.Look.NORMAL)))
                                 .then(ClientCommandManager.literal("wet").executes(ctx -> look(r, Restyler.Look.WET))))
+                        .then(ClientCommandManager.literal("debug").executes(ctx -> {
+                            r.setDebugView(!r.isDebugView());
+                            Restyler.say("Debug view " + (r.isDebugView() ? "ON: green sharp, blue sharp waiting for "
+                                    + "focus, yellow 1x, red not cached / being repainted, white = the 12 tiles"
+                                    : "OFF"), false);
+                            return 1;
+                        }))
                         .then(ClientCommandManager.literal("model")
                                 .executes(ctx -> {
                                     r.useModel("");

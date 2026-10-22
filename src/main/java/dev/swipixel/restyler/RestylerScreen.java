@@ -61,7 +61,7 @@ public class RestylerScreen extends Screen {
 
         addDrawableChild(ButtonWidget.builder(onOff("Performance", r.isStabilizer()), b -> {
             r.setStabilizer(!r.isStabilizer());
-            b.setMessage(onOff("Performance", r.isStabilizer()));
+            clearAndInit();   // the Performance-only controls appear / disappear
         }).dimensions(x, y, hw, BH).tooltip(Tooltip.of(Text.literal(
                 "Performance mode: 60 FPS - the network runs in the background and its look is moved along with "
                         + "the camera.\n!! Greatly reduces quality: rain reflections, gloss and fine details suffer.\n"
@@ -78,16 +78,28 @@ public class RestylerScreen extends Screen {
         y += BH + GAP;
 
         if (r.isAsync()) {
-            addDrawableChild(new Slider(x, y, hw, BH, "Detail", r.getDetail() / 1.5,
+            addDrawableChild(new Slider(x, y, BW, BH, "Detail", r.getDetail() / 1.5,
                     v -> r.setDetail((float) (v * 1.5))));
-            addDrawableChild(ButtonWidget.builder(onOff("Texel snap", r.isTexelSnap()), b -> {
-                r.setTexelSnap(!r.isTexelSnap());
-                b.setMessage(onOff("Texel snap", r.isTexelSnap()));
-            }).dimensions(x + hw + GAP, y, hw, BH).tooltip(Tooltip.of(Text.literal(
-                    "ON: the look is read once per block texel - locked to the block grid, pixel-art crisp.\n"
-                            + "OFF: smooth, as before."))).build());
             y += BH + GAP;
         }
+        addDrawableChild(ButtonWidget.builder(partialText(), b -> {
+            r.setPartialUpdate(!r.isPartialUpdate());
+            b.setMessage(partialText());
+        }).dimensions(x, y, hw, BH).tooltip(Tooltip.of(Text.literal(
+                "ON: only the part of the screen that changed is repainted (turning: the new strip; standing "
+                        + "still: nothing, or just the moving mob).\nPerformance OFF: more FPS while little changes "
+                        + "(walking forward stays ~20). Reused parts keep their old reflections until they are "
+                        + "repainted.\nPerformance ON: the look follows faster, the GPU rests.\n"
+                        + "Needs <model>_partial.onnx next to the model (make_partial.py)."))).build());
+        addDrawableChild(ButtonWidget.builder(onOff("Sharpen", r.isSharpen()), b -> {
+            r.setSharpen(!r.isSharpen());
+            b.setMessage(onOff("Sharpen", r.isSharpen()));
+        }).dimensions(x + hw + GAP, y, hw, BH).tooltip(Tooltip.of(Text.literal(
+                "Needs Partial update. Free time repaints the screen at 2.5x resolution, tile by tile in the "
+                        + "background; when all is done the screen focuses at once (about 1.2 s standing). Sharp parts "
+                        + "move with the camera and survive repaints; what changes drops back to 1x.\nNot in WetCraft "
+                        + "(its puddles would turn into small glints)."))).build());
+        y += BH + GAP;
         addDrawableChild(ButtonWidget.builder(onOff("Light lock", r.isLightLock()), b -> {
             r.setLightLock(!r.isLightLock());
             b.setMessage(onOff("Light lock", r.isLightLock()));
@@ -102,8 +114,19 @@ public class RestylerScreen extends Screen {
                         + "Needs vignette.json in config/restyler (made by vignette_v3.py)."))).build());
         y += BH + GAP + 6;
 
+        addDrawableChild(ButtonWidget.builder(onOff("Debug view", r.isDebugView()), b -> {
+            r.setDebugView(!r.isDebugView());
+            b.setMessage(onOff("Debug view", r.isDebugView()));
+        }).dimensions(x, y, BW, BH).tooltip(Tooltip.of(Text.literal(
+                "Performance or Partial only. Colours what is cached:\ngreen = sharp (2.5x)\nblue = sharp, waiting "
+                        + "for the focus\nyellow = 1x\nred = not cached / being repainted\nwhite lines = the 12 "
+                        + "sharpening tiles"))).build());
+        y += BH + GAP;
         addDrawableChild(ButtonWidget.builder(Text.literal("Done"), b -> close()).dimensions(x, y, BW, BH).build());
+        bottom = y + BH + 8;
     }
+
+    private int bottom = 0;
 
     private Text lookText() {
         return Text.literal("Look: " + r.getLook().title);
@@ -115,6 +138,10 @@ public class RestylerScreen extends Screen {
 
     private static Text onOff(String name, boolean on) {
         return Text.literal(name + ": " + (on ? "ON" : "OFF"));
+    }
+
+    private Text partialText() {
+        return Text.literal("Partial: " + (!r.hasPartialModel() ? "no model" : r.isPartialUpdate() ? "ON" : "OFF"));
     }
 
     private Text dehazeText() {
@@ -135,7 +162,7 @@ public class RestylerScreen extends Screen {
     public void renderBackground(DrawContext context, int mouseX, int mouseY, float delta) {
         // no blur: the restyled world stays visible behind the menu
         int x = (width - BW) / 2;
-        context.fill(x - 8, 8, x + BW + 8, 34 + 8 * (BH + GAP) + 20, 0x88000000);
+        context.fill(x - 8, 8, x + BW + 8, bottom, 0x88000000);
     }
 
     @Override
